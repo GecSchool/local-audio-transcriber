@@ -1,0 +1,62 @@
+{
+  "skill_name": "manage-skills",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "3개의 API 파일이 변경되었습니다 (src/api/router.ts, src/api/handler.ts, src/api/middleware.ts). 현재 등록된 verify 스킬은 없습니다. /manage-skills를 실행하세요.",
+      "expected_output": "verify-api 스킬 생성 제안. 3개 파일을 커버하는 새 스킬을 만들겠다고 제안해야 함.",
+      "files": [],
+      "assertions": [
+        "Should detect 3 uncovered files",
+        "Should propose creating verify-api skill",
+        "Should ask user for confirmation"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "verify-auth 스킬이 참조하는 src/auth/auth.ts 파일이 삭제되었습니다. /manage-skills를 실행하세요.",
+      "expected_output": "verify-auth 스킬 업데이트 제안. auth.ts 참조를 제거하겠다고 제안해야 함.",
+      "files": [],
+      "assertions": [
+        "Should detect stale file reference in verify-auth",
+        "Should propose UPDATE (not CREATE)",
+        "Should remove auth.ts from Related Files"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "README.md 파일만 변경되었습니다. /manage-skills를 실행하세요.",
+      "expected_output": "액션 불필요. README.md는 문서 파일이므로 면제라고 보고해야 함.",
+      "files": [],
+      "assertions": [
+        "Should recognize README.md as documentation",
+        "Should mark as exempt",
+        "Should not propose any skill creation/update"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "새로운 API 엔드포인트 2개와 테스트 파일 1개가 추가되었습니다 (src/api/users.route.ts, src/api/posts.route.ts, tests/api.test.ts). verify-api 스킬이 이미 존재합니다. /manage-skills를 실행하세요.",
+      "expected_output": "verify-api 스킬 업데이트 제안. 2개의 새 route 파일을 Related Files에 추가하고, 테스트 파일 체크를 추가하겠다고 제안해야 함.",
+      "files": [],
+      "assertions": [
+        "Should detect 2 new route files related to verify-api",
+        "Should propose UPDATE verify-api",
+        "Should add both route files to Related Files",
+        "Should add test file check if not present"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "10개 파일이 3개의 다른 도메인에 걸쳐 변경되었습니다: API (4개), Auth (3개), Database (3개). 각 도메인에 대한 verify 스킬이 없습니다. /manage-skills를 실행하세요.",
+      "expected_output": "3개의 새 스킬 생성 제안 (verify-api, verify-auth, verify-database). 각각의 파일 그룹을 분리하여 제안해야 함.",
+      "files": [],
+      "assertions": [
+        "Should detect 3 distinct domains",
+        "Should propose creating 3 separate skills",
+        "Should group files by domain correctly"
+      ]
+    }
+  ],
+  "notes": "These evals test the core decision-making logic of manage-skills: CREATE vs UPDATE, domain grouping, and exemption rules."
+}
