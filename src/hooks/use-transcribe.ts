@@ -1,96 +1,183 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { toast } from "sonner";
 
-interface TranscribeState {
-  status: "idle" | "uploading" | "processing" | "done" | "error";
-  progress: number;
-  result: string | null;
+export interface Job {
+  jobId: string;
+  filename: string;
+  status: "pending" | "processing" | "done" | "error";
+  text: string | null;
   processingTime: number | null;
   error: string | null;
 }
 
-const initialState: TranscribeState = {
-  status: "idle",
-  progress: 0,
-  result: null,
-  processingTime: null,
-  error: null,
-};
+const STORAGE_KEY = "stt_jobs";
+type StoredJob = { jobId: string; filename: string };
+
+function loadStored(): StoredJob[] {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveStored(jobs: StoredJob[]) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(jobs));
+}
+
+function mapJobData(data: Record<string, unknown>): Partial<Job> {
+  return {
+    status: data.status as Job["status"],
+    text: (data.text as string) ?? null,
+    processingTime: (data.processing_time as number) ?? null,
+    error: (data.error as string) ?? null,
+  };
+}
 
 export function useTranscribe() {
-  const [state, setState] = useState<TranscribeState>(initialState);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const jobsRef = useRef<Job[]>([]);
+  const notifiedRef = useRef<Set<string>>(new Set());
 
-  function clearProgressInterval() {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
+  useEffect(() => {
+    jobsRef.current = jobs;
+  }, [jobs]);
+
+  async function pollOne(jobId: string, filename: string) {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`);
+      if (res.status === 404) {
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.jobId === jobId
+              ? { ...j, status: "error", error: "서버가 재시작되어 잡이 손실되었습니다." }
+              : j
+          )
+        );
+        return;
+      }
+      if (!res.ok) return;
+      const data = await res.json();
+      setJobs((prev) =>
+        prev.map((j) => (j.jobId === jobId ? { ...j, ...mapJobData(data) } : j))
+      );
+      if (data.status === "done" && !notifiedRef.current.has(jobId)) {
+        notifiedRef.current.add(jobId);
+        toast.success(`변환 완료: ${filename}`);
+      } else if (data.status === "error" && !notifiedRef.current.has(jobId)) {
+        notifiedRef.current.add(jobId);
+        toast.error(`변환 실패: ${filename}`);
+      }
+    } catch {
+      // ignore network errors during polling
     }
   }
 
-  async function transcribe(file: File): Promise<void> {
-    setState({ ...initialState, status: "uploading", progress: 0 });
+  // On mount: recover jobs from localStorage
+  useEffect(() => {
+    const stored = loadStored();
+    if (stored.length === 0) return;
 
-    // Simulate upload progress 0 → 40
-    let uploadProgress = 0;
-    intervalRef.current = setInterval(() => {
-      uploadProgress = Math.min(uploadProgress + 4, 38);
-      setState((prev) => ({ ...prev, progress: uploadProgress }));
-    }, 100);
+    setJobs(
+      stored.map(({ jobId, filename }) => ({
+        jobId,
+        filename,
+        status: "pending",
+        text: null,
+        processingTime: null,
+        error: null,
+      }))
+    );
 
+    Promise.all(
+      stored.map(async ({ jobId }) => {
+        try {
+          const res = await fetch(`/api/jobs/${jobId}`);
+          if (res.status === 404) {
+            return { jobId, updates: { status: "error" as const, error: "서버가 재시작되어 잡이 손실되었습니다." } };
+          }
+          if (!res.ok) return null;
+          const data = await res.json();
+          return { jobId, updates: mapJobData(data) };
+        } catch {
+          return null;
+        }
+      })
+    ).then((results) => {
+      setJobs((prev) =>
+        prev.map((j) => {
+          const found = results.find((r) => r?.jobId === j.jobId);
+          if (!found) return j;
+          const updated = { ...j, ...found.updates };
+          // Don't toast for jobs that were already done before browser was closed
+          if (updated.status === "done" || updated.status === "error") {
+            notifiedRef.current.add(j.jobId);
+          }
+          return updated;
+        })
+      );
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Polling interval for active jobs
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const active = jobsRef.current.filter(
+        (j) => j.status === "pending" || j.status === "processing"
+      );
+      active.forEach((j) => pollOne(j.jobId, j.filename));
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function submit(file: File) {
     const formData = new FormData();
     formData.append("file", file);
 
-    let response: Response;
+    let res: Response;
     try {
-      response = await fetch("/api/transcribe", {
-        method: "POST",
-        body: formData,
-      });
+      res = await fetch("/api/transcribe", { method: "POST", body: formData });
     } catch {
-      clearProgressInterval();
-      const errorMsg = "네트워크 오류가 발생했습니다.";
-      setState({ ...initialState, status: "error", error: errorMsg });
-      toast.error(errorMsg);
+      toast.error("네트워크 오류가 발생했습니다.");
       return;
     }
 
-    clearProgressInterval();
+    const body = await res.json().catch(() => ({}));
 
-    // Transition to processing: progress 40 → 90
-    setState((prev) => ({ ...prev, status: "processing", progress: 40 }));
-
-    let processingProgress = 40;
-    intervalRef.current = setInterval(() => {
-      processingProgress = Math.min(processingProgress + 2, 90);
-      setState((prev) => ({ ...prev, progress: processingProgress }));
-    }, 200);
-
-    const data = await response.json();
-    clearProgressInterval();
-
-    if (!response.ok || data.error) {
-      const errorMsg = data.error ?? "변환 중 오류가 발생했습니다.";
-      setState({ ...initialState, status: "error", error: errorMsg });
-      toast.error(errorMsg);
+    if (!res.ok || body.error) {
+      toast.error(body.error ?? "업로드 실패");
       return;
     }
 
-    setState({
-      status: "done",
-      progress: 100,
-      result: data.text,
-      processingTime: data.processing_time,
+    const { job_id } = body;
+    const newJob: Job = {
+      jobId: job_id,
+      filename: file.name,
+      status: "pending",
+      text: null,
+      processingTime: null,
       error: null,
-    });
+    };
+
+    setJobs((prev) => [newJob, ...prev]);
+    saveStored([{ jobId: job_id, filename: file.name }, ...loadStored()]);
+    pollOne(job_id, file.name);
   }
 
-  function reset() {
-    clearProgressInterval();
-    setState(initialState);
+  function removeJob(jobId: string) {
+    setJobs((prev) => prev.filter((j) => j.jobId !== jobId));
+    saveStored(loadStored().filter((j) => j.jobId !== jobId));
   }
 
-  return { ...state, transcribe, reset };
+  function clearDone() {
+    const remaining = jobsRef.current.filter(
+      (j) => j.status !== "done" && j.status !== "error"
+    );
+    setJobs(remaining);
+    saveStored(remaining.map((j) => ({ jobId: j.jobId, filename: j.filename })));
+  }
+
+  return { jobs, submit, removeJob, clearDone };
 }

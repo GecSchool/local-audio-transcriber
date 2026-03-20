@@ -4,7 +4,7 @@ export async function POST(request: Request) {
   try {
     const formData = await request.formData();
 
-    const response = await fetch("http://localhost:5000/transcribe", {
+    const response = await fetch("http://localhost:8000/transcribe", {
       method: "POST",
       body: formData,
     });
@@ -17,7 +17,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const data = await response.json();
+    const data = await response.json(); // { job_id }
     return NextResponse.json(data);
   } catch (err: unknown) {
     const isConnRefused =

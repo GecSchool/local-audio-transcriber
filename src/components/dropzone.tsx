@@ -1,7 +1,6 @@
 "use client";
 
-import { useRef, useState, DragEvent } from "react";
-import { Input } from "@/components/ui/input";
+import { useId, useState, DragEvent } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { CloudUploadIcon } from "@hugeicons/core-free-icons";
 
@@ -11,34 +10,34 @@ interface DropzoneProps {
 }
 
 export function Dropzone({ onFileSelect, disabled }: DropzoneProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputId = useId();
   const [isDragging, setIsDragging] = useState(false);
 
-  function handleDragOver(e: DragEvent<HTMLDivElement>) {
+  function handleDragOver(e: DragEvent<HTMLLabelElement>) {
     e.preventDefault();
     setIsDragging(true);
   }
 
-  function handleDragLeave(e: DragEvent<HTMLDivElement>) {
+  function handleDragLeave(e: DragEvent<HTMLLabelElement>) {
     e.preventDefault();
     setIsDragging(false);
   }
 
-  function handleDrop(e: DragEvent<HTMLDivElement>) {
+  function handleDrop(e: DragEvent<HTMLLabelElement>) {
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files[0];
     if (file) onFileSelect(file);
   }
 
-  function handleChange() {
-    const file = inputRef.current?.files?.[0];
+  function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
     if (file) onFileSelect(file);
   }
 
   return (
-    <div
-      onClick={() => !disabled && inputRef.current?.click()}
+    <label
+      htmlFor={inputId}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -53,13 +52,14 @@ export function Dropzone({ onFileSelect, disabled }: DropzoneProps) {
         <p className="text-sm font-medium">오디오 파일을 드래그하거나 클릭하여 업로드</p>
         <p className="text-xs text-muted-foreground mt-1">지원 형식: MP3, WAV, M4A, MP4, WEBM</p>
       </div>
-      <Input
-        ref={inputRef}
+      <input
+        id={inputId}
         type="file"
         accept="audio/*,video/*"
-        className="hidden"
+        className="sr-only"
         onChange={handleChange}
+        disabled={disabled}
       />
-    </div>
+    </label>
   );
 }
