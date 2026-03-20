@@ -1,17 +1,34 @@
 "use client";
 
+import { useState } from "react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Dropzone } from "@/components/dropzone";
 import { JobCard } from "@/components/job-card";
 import { SiteHeader } from "@/components/site-header";
 import { UsageGuide } from "@/components/usage-guide";
+import { TranscribeForm } from "@/components/transcribe-form";
 import { useTranscribe } from "@/hooks/use-transcribe";
 
 export default function Home() {
   const { jobs, submit, removeJob, clearDone } = useTranscribe();
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
 
   const hasDone = jobs.some((j) => j.status === "done" || j.status === "error");
+
+  function handleFileSelect(file: File) {
+    setPendingFile(file);
+  }
+
+  function handleFormSubmit(subject: string, topic: string, useLlm: boolean) {
+    if (!pendingFile) return;
+    submit(pendingFile, subject, topic, useLlm);
+    setPendingFile(null);
+  }
+
+  function handleFormCancel() {
+    setPendingFile(null);
+  }
 
   return (
     <>
@@ -25,7 +42,15 @@ export default function Home() {
             </p>
           </CardHeader>
           <CardContent>
-            <Dropzone onFileSelect={submit} />
+            {pendingFile ? (
+              <TranscribeForm
+                file={pendingFile}
+                onSubmit={handleFormSubmit}
+                onCancel={handleFormCancel}
+              />
+            ) : (
+              <Dropzone onFileSelect={handleFileSelect} />
+            )}
           </CardContent>
         </Card>
 

@@ -1,4 +1,5 @@
 import asyncio
+import glob
 import hashlib
 import os
 import platform
@@ -9,10 +10,24 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 load_dotenv(".env.local")
+
+# ── ffmpeg 가용성 체크 ──────────────────────────────────────────────────────
+
+def _check_ffmpeg() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+HAS_FFMPEG = _check_ffmpeg()
+print(f"[STT] ffmpeg: {'available' if HAS_FFMPEG else 'not found (preprocessing skipped)'}")
 
 # ── 백엔드 선택 ────────────────────────────────────────────────────────────
 
@@ -90,12 +105,50 @@ app.add_middleware(
 
 _jobs: dict[str, dict] = {}
 _cache: dict[str, dict] = {}
-_sem = asyncio.Semaphore(1)  # 로컬: GPU 직렬화 / API: 동시 요청 제한
+_sem = asyncio.Semaphore(1 if BACKEND in ("mlx", "faster-whisper") else 5)  # 로컬: GPU 직렬화 / API: 최대 5개 병렬
 _executor = ThreadPoolExecutor(max_workers=1)
+
+# ── 전처리 함수 ────────────────────────────────────────────────────────────
+
+def _preprocess_audio(input_path: str) -> str:
+    """전처리된 WAV 파일 경로 반환. ffmpeg 없으면 원본 경로 반환."""
+    if not HAS_FFMPEG:
+        return input_path
+    out_path = input_path + "_preprocessed.wav"
+    subprocess.run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-af", "highpass=f=80,lowpass=f=8000,equalizer=f=2500:width_type=o:width=2:g=3,afftdn=nf=-25,dynaudnorm=g=15:f=250:r=0.9",
+        "-ar", "16000", "-ac", "1",
+        out_path
+    ], capture_output=True, check=True)
+    return out_path
+
+
+def _split_chunks(audio_path: str, chunk_sec: int = 300) -> list[str]:
+    """WAV → chunk_000.wav, chunk_001.wav, ... 반환. ffmpeg 없으면 원본 1개 반환."""
+    if not HAS_FFMPEG:
+        return [audio_path]
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        capture_output=True, text=True
+    )
+    duration = float(probe.stdout.strip() or "0")
+    if duration <= chunk_sec:
+        return [audio_path]
+
+    chunk_pattern = audio_path + "_chunk_%03d.wav"
+    subprocess.run([
+        "ffmpeg", "-y", "-i", audio_path,
+        "-f", "segment", "-segment_time", str(chunk_sec),
+        "-reset_timestamps", "1", chunk_pattern
+    ], capture_output=True, check=True)
+    chunks = sorted(glob.glob(audio_path + "_chunk_*.wav"))
+    return chunks if chunks else [audio_path]
 
 # ── 변환 함수 ──────────────────────────────────────────────────────────────
 
-def _run_transcribe(tmp_path: str, filename: str) -> str:
+def _run_transcribe(tmp_path: str, filename: str, prompt: str = "") -> str:
     if BACKEND == "groq":
         with open(tmp_path, "rb") as f:
             transcription = _groq_client.audio.transcriptions.create(
@@ -103,6 +156,7 @@ def _run_transcribe(tmp_path: str, filename: str) -> str:
                 model="whisper-large-v3",
                 language="ko",
                 response_format="text",
+                prompt=prompt or None,
             )
         return transcription  # response_format="text" → str 반환
 
@@ -112,6 +166,7 @@ def _run_transcribe(tmp_path: str, filename: str) -> str:
                 model="whisper-1",
                 file=f,
                 language="ko",
+                prompt=prompt or None,
             )
         return transcription.text
 
@@ -122,6 +177,7 @@ def _run_transcribe(tmp_path: str, filename: str) -> str:
             path_or_hf_repo=f"mlx-community/whisper-{MODEL_NAME}-mlx",
             language="ko",
             condition_on_previous_text=False,
+            initial_prompt=prompt or None,
         )
         return result["text"]
 
@@ -131,27 +187,92 @@ def _run_transcribe(tmp_path: str, filename: str) -> str:
         beam_size=5,
         language="ko",
         condition_on_previous_text=False,
+        initial_prompt=prompt or None,
     )
     return " ".join([s.text for s in segments])
 
 
-async def _process_job(job_id: str, tmp_path: str, file_hash: str, filename: str) -> None:
+def _llm_summarize(text: str, subject: str, topic: str) -> str:
+    """원본 텍스트를 건드리지 않고 마크다운 정리본 생성."""
+    if not GROQ_API_KEY:
+        return ""
+    from groq import Groq
+    client = Groq(api_key=GROQ_API_KEY)
+    context = f"{subject} {topic}".strip()
+    system = (
+        "당신은 한국어 강의 전사 텍스트를 마크다운 강의 노트로 정리하는 전문가입니다. "
+        "전사 텍스트에 실제로 언급된 내용만 사용하고 내용을 추가로 만들지 마세요. "
+        "제목, 소제목, 핵심 개념, 중요 포인트를 마크다운 형식으로 구조화하세요."
+    )
+    user = f"{'과목/주제: ' + context + chr(10) if context else ''}다음 강의 전사 텍스트를 마크다운 강의 노트로 정리해주세요:\n\n{text}"
+    resp = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def _run_pipeline(tmp_path: str, filename: str, subject: str, topic: str, use_llm: bool) -> tuple[str, str]:
+    """(원본 전사 텍스트, 정리본 마크다운) 반환. use_llm=False면 정리본은 빈 문자열."""
+    prompt = " ".join(filter(None, [subject, topic, "강의"])).strip()
+    print(f"[STT] prompt: {prompt!r} | use_llm: {use_llm}")
+
+    extra_files: list[str] = []
+    try:
+        preprocessed_path = _preprocess_audio(tmp_path)
+        if preprocessed_path != tmp_path:
+            extra_files.append(preprocessed_path)
+
+        chunks = _split_chunks(preprocessed_path)
+        for chunk in chunks:
+            if chunk != preprocessed_path and chunk != tmp_path:
+                extra_files.append(chunk)
+
+        print(f"[STT] chunks: {len(chunks)}")
+        texts = [_run_transcribe(chunk, filename, prompt) for chunk in chunks]
+        text = " ".join(texts).strip()
+
+        summary = ""
+        if use_llm:
+            print("[STT] LLM 정리본 생성 시작")
+            summary = _llm_summarize(text, subject, topic)
+
+        return text, summary
+    finally:
+        for f in extra_files:
+            try:
+                os.unlink(f)
+            except Exception:
+                pass
+
+
+async def _process_job(
+    job_id: str,
+    tmp_path: str,
+    cache_key: str,
+    filename: str,
+    subject: str,
+    topic: str,
+    use_llm: bool,
+) -> None:
     async with _sem:
         _jobs[job_id]["status"] = "processing"
         start = time.time()
         try:
             loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(
-                _executor, _run_transcribe, tmp_path, filename
+            text, summary = await loop.run_in_executor(
+                _executor, _run_pipeline, tmp_path, filename, subject, topic, use_llm
             )
             processing_time = round(time.time() - start, 2)
-            text = text.strip()
             _jobs[job_id].update({
                 "status": "done",
                 "text": text,
+                "summary": summary,
                 "processing_time": processing_time,
             })
-            _cache[file_hash] = {"text": text, "processing_time": processing_time}
+            _cache[cache_key] = {"text": text, "summary": summary, "processing_time": processing_time}
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -164,6 +285,32 @@ async def _process_job(job_id: str, tmp_path: str, file_hash: str, filename: str
 
 # ── 엔드포인트 ─────────────────────────────────────────────────────────────
 
+@app.post("/debug/preprocess")
+async def debug_preprocess(file: UploadFile = File(...)):
+    """전처리된 WAV 파일을 바로 다운로드. ffmpeg 테스트용."""
+    if not HAS_FFMPEG:
+        raise HTTPException(status_code=503, detail="ffmpeg이 설치되어 있지 않습니다.")
+    content = await file.read()
+    filename = file.filename or "input"
+    suffix = os.path.splitext(filename)[1] if "." in filename else ".tmp"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(content)
+    tmp.close()
+    try:
+        out_path = _preprocess_audio(tmp.name)
+    except subprocess.CalledProcessError as e:
+        os.unlink(tmp.name)
+        raise HTTPException(status_code=500, detail=f"ffmpeg 실패: {e.stderr.decode(errors='ignore')}")
+    os.unlink(tmp.name)
+    stem = os.path.splitext(filename)[0]
+    return FileResponse(
+        out_path,
+        media_type="audio/wav",
+        filename=f"{stem}_preprocessed.wav",
+        background=BackgroundTask(os.unlink, out_path),
+    )
+
+
 @app.get("/config")
 async def get_config():
     return {
@@ -173,18 +320,27 @@ async def get_config():
 
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
+async def transcribe(
+    file: UploadFile = File(...),
+    subject: str = Form(""),
+    topic: str = Form(""),
+    use_llm: str = Form("false"),
+):
+    use_llm_bool = use_llm.lower() == "true"
     content = await file.read()
-    file_hash = hashlib.sha256(content).hexdigest()
+    cache_key = hashlib.sha256(
+        content + subject.encode() + topic.encode() + str(use_llm_bool).encode()
+    ).hexdigest()
     job_id = str(uuid.uuid4())
     filename = file.filename or "unknown"
 
-    if file_hash in _cache:
-        cached = _cache[file_hash]
+    if cache_key in _cache:
+        cached = _cache[cache_key]
         _jobs[job_id] = {
             "status": "done",
             "filename": filename,
             "text": cached["text"],
+            "summary": cached.get("summary", ""),
             "processing_time": cached["processing_time"],
             "error": None,
             "created_at": time.time(),
@@ -200,12 +356,15 @@ async def transcribe(file: UploadFile = File(...)):
         "status": "pending",
         "filename": filename,
         "text": None,
+        "summary": None,
         "processing_time": None,
         "error": None,
         "created_at": time.time(),
     }
 
-    asyncio.create_task(_process_job(job_id, tmp.name, file_hash, filename))
+    asyncio.create_task(
+        _process_job(job_id, tmp.name, cache_key, filename, subject, topic, use_llm_bool)
+    )
     return {"job_id": job_id}
 
 

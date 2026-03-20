@@ -8,6 +8,7 @@ export interface Job {
   filename: string;
   status: "pending" | "processing" | "done" | "error";
   text: string | null;
+  summary: string | null;
   processingTime: number | null;
   error: string | null;
 }
@@ -31,6 +32,7 @@ function mapJobData(data: Record<string, unknown>): Partial<Job> {
   return {
     status: data.status as Job["status"],
     text: (data.text as string) ?? null,
+    summary: (data.summary as string) ?? null,
     processingTime: (data.processing_time as number) ?? null,
     error: (data.error as string) ?? null,
   };
@@ -86,6 +88,7 @@ export function useTranscribe() {
         filename,
         status: "pending",
         text: null,
+        summary: null,
         processingTime: null,
         error: null,
       }))
@@ -132,9 +135,12 @@ export function useTranscribe() {
     return () => clearInterval(interval);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function submit(file: File) {
+  async function submit(file: File, subject: string, topic: string, useLlm: boolean) {
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("subject", subject);
+    formData.append("topic", topic);
+    formData.append("use_llm", String(useLlm));
 
     let res: Response;
     try {
@@ -157,6 +163,7 @@ export function useTranscribe() {
       filename: file.name,
       status: "pending",
       text: null,
+      summary: null,
       processingTime: null,
       error: null,
     };
